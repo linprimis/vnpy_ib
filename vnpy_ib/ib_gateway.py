@@ -4,7 +4,7 @@ IB Symbol Rules
 SPY-USD-STK   SMART
 EUR-USD-CASH  IDEALPRO
 XAUUSD-USD-CMDTY  SMART
-ES-202002-USD-FUT  GLOBEX
+ES-202002-USD-FUT  CME
 SI-202006-1000-USD-FUT  NYMEX
 ES-2020006-C-2430-50-USD-FOP  GLOBEX
 
@@ -111,7 +111,7 @@ EXCHANGE_VT2IB: Dict[Exchange, str] = {
     Exchange.OTC: "PINK",
     Exchange.SGX: "SGX"
 }
-EXCHANGE_IB2VT: Dict[str, Exchange] = {v: k for k, v in EXCHANGE_VT2IB.items()}
+EXCHANGE_IB2VT: Dict[str, Exchange] = {v: k for k, v in sorted(EXCHANGE_VT2IB.items(), key=lambda x: x[1])}
 
 # 产品类型映射
 PRODUCT_IB2VT: Dict[str, Product] = {
@@ -160,6 +160,25 @@ TICKFIELD_IB2VT: Dict[int, str] = {
     14: "open_price",
 }
 
+# 新增：延时切片数据字段映射
+DELAYEDTICKFIELD_IB2VT: Dict[int, str] = {
+    66: "bid_price_1",
+    67: "ask_price_1",
+    68: "last_price",
+    69: "bid_volume_1",
+    70: "ask_volume_1",
+    71: "last_volume",
+    72: "high_price",
+    73: "low_price",
+    74: "volume",
+    75: "close_price",
+    76: "open_price",   ## not currently avalaible
+    80: "bid",
+    81: "ask",
+    82: "last",
+    83: "model",
+}
+
 # 账户类型映射
 ACCOUNTFIELD_IB2VT: Dict[str, str] = {
     "NetLiquidationByCurrency": "balance",
@@ -193,7 +212,8 @@ class IbGateway(BaseGateway):
         "TWS端口": 7497,
         "客户号": 1,
         "交易账户": "",
-        "查询期权": ["否", "是"]
+        "查询期权": ["否", "是"],
+        "允许延时数据": ["否", "是"],
     }
 
     exchanges: List[str] = list(EXCHANGE_VT2IB.keys())
@@ -212,6 +232,8 @@ class IbGateway(BaseGateway):
         clientid: int = setting["客户号"]
         account: str = setting["交易账户"]
         query_options: bool = setting["查询期权"] == "是"
+
+        self.mkt_data_type: int = 3 if setting["允许延时数据"] == "是" else 0
 
         self.api.connect(host, port, clientid, account, query_options)
 
@@ -333,8 +355,7 @@ class IbApi(EWrapper):
         advancedOrderRejectJson: str = ""
     ) -> None:
         """具体错误请求回报"""
-        super().error(reqId, errorCode, errorString)
-
+        super().error(reqId, errorCode, errorString, advancedOrderRejectJson)
         # 2000-2999信息通知不属于报错信息
         if reqId == self.history_reqid and errorCode not in range(2000, 3000):
             self.history_condition.acquire()
@@ -346,6 +367,13 @@ class IbApi(EWrapper):
 
         # 行情服务器已连接
         if errorCode == 2104 and not self.data_ready:
+            # 处理延时数据
+            if self.gateway.mkt_data_type == 3:
+                self.gateway.write_log("允许延时数据")
+                global TICKFIELD_IB2VT, DELAYEDTICKFIELD_IB2VT
+                TICKFIELD_IB2VT.update(DELAYEDTICKFIELD_IB2VT)
+                self.client.reqMarketDataType(self.gateway.mkt_data_type)
+
             self.data_ready = True
 
             self.client.reqCurrentTime()
@@ -354,6 +382,19 @@ class IbApi(EWrapper):
             self.subscribed.clear()
             for req in reqs:
                 self.subscribe(req)
+
+        # 行情连接中断
+        if errorCode == 2103:
+            self.data_ready = False
+
+        # 处理订单错误
+        if 103 <= errorCode <= 303  or errorCode == 463:
+            orderid: str = str(reqId)
+            order: OrderData = self.orders.get(orderid, None)
+            if order:
+                order.status = Status.REJECTED
+                order.reject_reason = errorString + advancedOrderRejectJson     ## 补充额外字段
+                self.gateway.on_order(copy(order))
 
     def tickPrice(self, reqId: TickerId, tickType: TickType, price: float, attrib: TickAttrib) -> None:
         """tick价格更新回报"""
@@ -398,8 +439,12 @@ class IbApi(EWrapper):
         """tick字符串更新回报"""
         super().tickString(reqId, tickType, value)
 
-        if tickType != TickTypeEnum.LAST_TIMESTAMP:
-            return
+        if self.gateway.mkt_data_type==3:
+            if tickType not in [TickTypeEnum.LAST_TIMESTAMP, TickTypeEnum.DELAYED_LAST_TIMESTAMP]:
+                return
+        else:
+            if tickType != TickTypeEnum.LAST_TIMESTAMP:
+                return
 
         tick: TickData = self.ticks[reqId]
         dt: datetime = datetime.fromtimestamp(int(value))
@@ -891,11 +936,18 @@ class IbApi(EWrapper):
         elif req.type == OrderType.STOP:
             ib_order.auxPrice = req.price
 
+        if hasattr(req,"order_config"):
+            ## order config dict object, check IB API document
+            for k,v in req.order_config.items():
+                setattr(ib_order,k,v)
+
+        # 先记录提交中状态，后发送给服务器
+        order: OrderData = req.create_order_data(str(self.orderid), self.gateway_name)
+        self.orders[order.orderid] = order
+        self.gateway.on_order(order)
+
         self.client.placeOrder(self.orderid, ib_contract, ib_order)
         self.client.reqIds(1)
-
-        order: OrderData = req.create_order_data(str(self.orderid), self.gateway_name)
-        self.gateway.on_order(order)
         return order.vt_orderid
 
     def cancel_order(self, req: CancelRequest) -> None:
