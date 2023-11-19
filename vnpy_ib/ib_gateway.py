@@ -111,7 +111,7 @@ EXCHANGE_VT2IB: Dict[Exchange, str] = {
     Exchange.OTC: "PINK",
     Exchange.SGX: "SGX"
 }
-EXCHANGE_IB2VT: Dict[str, Exchange] = {v: k for k, v in sorted(EXCHANGE_VT2IB.items(), key=lambda x: x[1])}
+EXCHANGE_IB2VT: Dict[str, Exchange] = {v: k for k, v in EXCHANGE_VT2IB.items()}
 
 # 产品类型映射
 PRODUCT_IB2VT: Dict[str, Product] = {
@@ -216,7 +216,7 @@ class IbGateway(BaseGateway):
         "允许延时数据": ["否", "是"],
     }
 
-    exchanges: List[str] = list(EXCHANGE_VT2IB.keys())
+    exchanges: List[str] = sorted(list(EXCHANGE_VT2IB.keys()),key=lambda x:EXCHANGE_VT2IB[x])
 
     def __init__(self, event_engine: EventEngine, gateway_name: str) -> None:
         """构造函数"""
@@ -875,7 +875,7 @@ class IbApi(EWrapper):
         self.subscribed[req.vt_symbol] = req
 
         # 解析IB合约详情
-        ib_contract: Contract = generate_ib_contract(req.symbol, req.exchange)
+        ib_contract: Contract = self.generate_ib_contract(req.symbol, req.exchange)
         if not ib_contract:
             self.gateway.write_log("代码解析失败，请检查格式是否正确")
             return
@@ -918,7 +918,7 @@ class IbApi(EWrapper):
 
         self.orderid += 1
 
-        ib_contract: Contract = generate_ib_contract(req.symbol, req.exchange)
+        ib_contract: Contract = self.generate_ib_contract(req.symbol, req.exchange)
         if not ib_contract:
             return ""
 
@@ -961,14 +961,14 @@ class IbApi(EWrapper):
         """查询历史数据"""
         contract: ContractData = self.contracts[req.vt_symbol]
         if not contract:
-            self.write_log(f"找不到合约：{req.vt_symbol}，请先订阅")
+            self.gateway.write_log(f"找不到合约：{req.vt_symbol}，请先订阅")
             return []
 
         self.history_req = req
 
         self.reqid += 1
 
-        ib_contract: Contract = generate_ib_contract(req.symbol, req.exchange)
+        ib_contract: Contract = self.generate_ib_contract(req.symbol, req.exchange)
 
         if req.end:
             end: datetime = req.end
@@ -1052,37 +1052,36 @@ class IbApi(EWrapper):
 
         return symbol
 
+    def generate_ib_contract(self,symbol: str, exchange: Exchange) -> Optional[Contract]:
+        """生产IB合约"""
+        # 字符串代码
+        if "-" in symbol:
+            try:
+                fields: list = symbol.split(JOIN_SYMBOL)
 
-def generate_ib_contract(symbol: str, exchange: Exchange) -> Optional[Contract]:
-    """生产IB合约"""
-    # 字符串代码
-    if "-" in symbol:
-        try:
-            fields: list = symbol.split(JOIN_SYMBOL)
+                ib_contract: Contract = Contract()
+                ib_contract.exchange = EXCHANGE_VT2IB[exchange]
+                ib_contract.secType = fields[-1]
+                ib_contract.currency = fields[-2]
+                ib_contract.symbol = fields[0]
 
+                if ib_contract.secType in ["FUT", "OPT", "FOP"]:
+                    ib_contract.lastTradeDateOrContractMonth = fields[1]
+
+                if ib_contract.secType == "FUT":
+                    if len(fields) == 5:
+                        ib_contract.multiplier = int(fields[2])
+
+                if ib_contract.secType in ["OPT", "FOP"]:
+                    ib_contract.right = fields[2]
+                    ib_contract.strike = float(fields[3])
+                    ib_contract.multiplier = int(fields[4])
+            except IndexError:
+                ib_contract = None
+        # 数字代码（ConId）
+        else:
             ib_contract: Contract = Contract()
             ib_contract.exchange = EXCHANGE_VT2IB[exchange]
-            ib_contract.secType = fields[-1]
-            ib_contract.currency = fields[-2]
-            ib_contract.symbol = fields[0]
+            ib_contract.conId = symbol
 
-            if ib_contract.secType in ["FUT", "OPT", "FOP"]:
-                ib_contract.lastTradeDateOrContractMonth = fields[1]
-
-            if ib_contract.secType == "FUT":
-                if len(fields) == 5:
-                    ib_contract.multiplier = int(fields[2])
-
-            if ib_contract.secType in ["OPT", "FOP"]:
-                ib_contract.right = fields[2]
-                ib_contract.strike = float(fields[3])
-                ib_contract.multiplier = int(fields[4])
-        except IndexError:
-            ib_contract = None
-    # 数字代码（ConId）
-    else:
-        ib_contract: Contract = Contract()
-        ib_contract.exchange = EXCHANGE_VT2IB[exchange]
-        ib_contract.conId = symbol
-
-    return ib_contract
+        return ib_contract
