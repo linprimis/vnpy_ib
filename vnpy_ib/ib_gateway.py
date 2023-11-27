@@ -388,7 +388,7 @@ class IbApi(EWrapper):
             self.data_ready = False
 
         # 处理订单错误
-        if 103 <= errorCode <= 303  or errorCode == 463:
+        if 103 <= errorCode <= 303  or errorCode in [321,463]:
             orderid: str = str(reqId)
             order: OrderData = self.orders.get(orderid, None)
             if order:
@@ -1072,7 +1072,7 @@ class IbApi(EWrapper):
         contracts: dict[str, ContractData] = {}
         for vt_symbol, contract in self.contracts.items():
             c: ContractData = copy(contract)
-            c.gateway_name = "IB"
+            c.gateway_name = self.gateway_name
             contracts[vt_symbol] = c
 
         f = shelve.open(self.data_filepath)
